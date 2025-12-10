@@ -19,12 +19,21 @@ MINIMAX_M2_API_KEY=your_api_key
 ```
 
 ## Install dependencies
+
+First install pnpm if you haven't installed it yet
+
 ```bash
-npm install
+npm install -g pnpm
+```
+
+Then install dependencies
+
+```bash
+pnpm install
 ```
 
 ## Run the code
 ```bash
-npm run start
+pnpm run start
 ```
 
