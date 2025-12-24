@@ -7,7 +7,7 @@ const anthropic = createAnthropic({
   baseURL: "https://api.minimax.io/anthropic/v1",
 });
 
-const model = aisdk(anthropic("minimax-m2.1"));
+const model = aisdk(anthropic("minimax-m2.1") as any);
 
 const agent = new Agent({
   name: "Language Agent",
@@ -19,4 +19,5 @@ const result = await run(
   agent,
   'What is the Indonessian translation of "Hello, world"?',
 );
+
 console.log(result);
