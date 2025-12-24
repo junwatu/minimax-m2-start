@@ -3,6 +3,7 @@ import { createAnthropic } from "@ai-sdk/anthropic";
 import { aisdk } from "@openai/agents-extensions";
 import { elevenlabs } from "@ai-sdk/elevenlabs";
 import { experimental_generateSpeech as generateSpeech } from 'ai';
+import { createHash } from 'crypto';
 
 const anthropic = createAnthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,
@@ -13,14 +14,29 @@ const anthropic = createAnthropic({
 
 const model = aisdk(anthropic("minimax-m2.1") as any);
 
+
+
 const podcastAgent = new Agent({
-  name: "Podcast Agent",
-  instructions: `You are a professional podcast script creator. Your task is to:
-1. Transform article content into an engaging podcast script
-2. The script should be conversational, engaging, and suitable for audio narration
-3. Include proper pacing, transitions, and natural language flow
-4. Structure the script with an introduction, main content, and conclusion
-5. Keep the language natural and easy to understand when spoken`,
+  name: "Podcast Generator AI",
+  instructions: `You are a podcast generator AI. Your task is to:
+
+1. Use the fetch_article tool to retrieve the full article content from the provided URL.
+
+2. Analyze and summarize the article into a dynamic podcast script, written as a simple natural dialogue between two speakers (Speaker A and Speaker B) and MUST BE less than 10000 characters
+
+Speaker A acts as the host: introduces the topic, asks questions, and drives the flow.
+
+Speaker B acts as the guest or expert: explains, elaborates, and adds insights.
+
+Keep the exchange conversational and lively, with natural back-and-forth, clarifications, and reactions.
+
+3. IMPORTANT: After creating the script, you MUST call the generate_speech tool with the dialogue formatted as an array of objects. Each object should have 'text' and 'voice_id' fields.
+
+Use these voice IDs:
+- Speaker A (Host): gmnazjXOFoOcWA59sd5m
+- Speaker B (Guest): 1kNciG1jHVSuFBPoxdRZ
+
+Always alternate speakers (A → B → A → B) and ensure the dialogue flows naturally.`,
   model,
 });
 
@@ -119,11 +135,13 @@ async function generatePodcastAudioDirectAPI(script: string, voiceId: string): P
       },
       body: JSON.stringify({
         text: script,
-        model_id: "eleven_monolingual_v1",
+        model_id: "eleven_turbo_v2", // Faster model
         voice_settings: {
-          stability: 0.5,
-          similarity_boost: 0.5,
+          stability: 0.75, // Higher stability = faster processing
+          similarity_boost: 0.25,
+          style: 0.0, // Disable style for speed
         },
+        optimize_streaming_latency: 2, // Optimize for speed
       }),
     }
   );
@@ -139,14 +157,29 @@ async function generatePodcastAudioDirectAPI(script: string, voiceId: string): P
   return audioBuffer;
 }
 
+// Simple in-memory cache for audio generation
+const audioCache = new Map<string, Buffer>();
+
+function getScriptHash(script: string): string {
+  return createHash('md5').update(script).digest('hex');
+}
+
 async function generatePodcastAudioWithRetry(script: string, maxRetries: number = 3): Promise<Buffer> {
   const voiceId = process.env.ELEVENLABS_VOICE_ID || "rachel";
+  
+  // Check cache first
+  const cacheKey = getScriptHash(script + voiceId);
+  if (audioCache.has(cacheKey)) {
+    console.log("🎯 Using cached audio...");
+    return audioCache.get(cacheKey)!;
+  }
   
   // Optimize script for ElevenLabs 10,000 character limit
   const maxLength = 9900; // Leave some buffer
   const optimizedScript = await optimizeScriptForAudio(script, maxLength);
   
   let lastError: Error | null = null;
+  let audioBuffer: Buffer | null = null;
   
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     console.log(`🎵 Audio generation attempt ${attempt}/${maxRetries}`);
@@ -157,7 +190,8 @@ async function generatePodcastAudioWithRetry(script: string, maxRetries: number 
       
       if (result.success && result.audio) {
         console.log(`✅ Audio generation successful on attempt ${attempt}`);
-        return result.audio;
+        audioBuffer = result.audio;
+        break;
       } else {
         throw new Error(result.error || 'Audio generation failed');
       }
@@ -170,7 +204,8 @@ async function generatePodcastAudioWithRetry(script: string, maxRetries: number 
       if (attempt === maxRetries || error.message.includes('timeout')) {
         console.log("🔄 Trying direct ElevenLabs API as fallback...");
         try {
-          return await generatePodcastAudioDirectAPI(optimizedScript, voiceId);
+          audioBuffer = await generatePodcastAudioDirectAPI(optimizedScript, voiceId);
+          break;
         } catch (directError) {
           console.log(`❌ Direct API also failed: ${directError.message}`);
           lastError = directError as Error;
@@ -185,7 +220,13 @@ async function generatePodcastAudioWithRetry(script: string, maxRetries: number 
     }
   }
   
-  throw new Error(`Audio generation failed after ${maxRetries} attempts. Last error: ${lastError?.message}`);
+  if (!audioBuffer) {
+    throw new Error(`Audio generation failed after ${maxRetries} attempts. Last error: ${lastError?.message}`);
+  }
+  
+  // Cache the result
+  audioCache.set(cacheKey, audioBuffer);
+  return audioBuffer;
 }
 
 async function generateSpeechWithProgress(script: string, voiceId: string): Promise<AudioGenerationResult> {
@@ -211,15 +252,16 @@ async function generateSpeechWithProgress(script: string, voiceId: string): Prom
     // Use a wrapper that handles the promise properly
     const audioPromise = new Promise((resolve, reject) => {
       generateSpeech({
-        model: elevenlabs.speech('eleven_multilingual_v2'),
+        model: elevenlabs.speech('eleven_turbo_v2'),
         text: script,
         voice: voiceId,
         providerOptions: {
           elevenlabs: {
             voiceSettings: {
-              stability: 0.5,
-              similarity_boost: 0.5,
+              stability: 0.75,
+              similarity_boost: 0.25,
             },
+            optimize_streaming_latency: 2,
           },
         },
       }).then(resolve).catch(reject);
@@ -300,53 +342,301 @@ async function generateSpeechWithProgress(script: string, voiceId: string): Prom
 }
 
 async function generatePodcastAudio(script: string): Promise<Buffer> {
+  // Try segmented generation first for long scripts
+  if (script.length > 3000) {
+    console.log("🎯 Using segmented audio generation for better performance...");
+    return await generateSegmentedAudio(script);
+  }
   return generatePodcastAudioWithRetry(script, 3);
 }
 
-async function createPodcastFromUrl(articleUrl: string, generateAudio: boolean = true): Promise<{ script: string; audio: Buffer }> {
-  console.log("Fetching article content...");
+async function generateSegmentedAudio(script: string): Promise<Buffer> {
+  const maxSegmentLength = 2500; // Optimal chunk size
+  const segments: string[] = [];
+  
+  // Split script into sentences and create segments
+  const sentences = script.match(/[^.!?]+[.!?]+/g) || [script];
+  let currentSegment = "";
+  
+  for (const sentence of sentences) {
+    if (currentSegment.length + sentence.length > maxSegmentLength && currentSegment) {
+      segments.push(currentSegment.trim());
+      currentSegment = sentence;
+    } else {
+      currentSegment += sentence;
+    }
+  }
+  
+  if (currentSegment) {
+    segments.push(currentSegment.trim());
+  }
+  
+  console.log(`🎵 Generating ${segments.length} audio segments in parallel...`);
+  
+  // Generate audio for segments in parallel
+  const audioPromises = segments.map(async (segment, index) => {
+    console.log(`🎙️ Segment ${index + 1}/${segments.length} (${segment.length} chars)`);
+    return await generatePodcastAudioWithRetry(segment, 2);
+  });
+  
+  try {
+    const audioBuffers = await Promise.all(audioPromises);
+    
+    // Concatenate audio buffers
+    const totalLength = audioBuffers.reduce((sum, buffer) => sum + buffer.length, 0);
+    const concatenatedBuffer = Buffer.concat(audioBuffers, totalLength);
+    
+    console.log(`✅ Segmented audio complete: ${concatenatedBuffer.length} bytes`);
+    return concatenatedBuffer;
+    
+  } catch (error) {
+    console.log("❌ Segmented generation failed, falling back to single segment...");
+    return generatePodcastAudioWithRetry(script, 2);
+  }
+}
+
+async function createPodcastFromUrl(articleUrl: string, generateAudio: boolean = true): Promise<{ script: string; audio: Buffer; dialogue?: Array<{ text: string; voice_id: string }> }> {
+  console.log("🎙️ Creating podcast using AGENTS.md format...");
   
   try {
     const articleContent = await fetchArticleContent(articleUrl);
-    console.log("Article content fetched successfully!");
+    console.log("✅ Article content fetched successfully!");
     
     const result = await run(
       podcastAgent,
-      `Transform the following article content into an engaging podcast script suitable for audio narration:
+      `Please create a podcast script from this article content following the exact format specified:
 
 ARTICLE CONTENT:
 ${articleContent}
 
-Please create a conversational podcast script with:
-1. An engaging introduction
-2. Main content with clear explanations
-3. A thoughtful conclusion
-4. Natural language that flows well when spoken aloud`
+REQUIREMENTS:
+1. Create a dialogue between Speaker A (Host) and Speaker B (Guest)
+2. MUST be less than 10,000 characters total
+3. Format as JSON with this structure:
+{
+  "dialogue": [
+    {"text": "Speaker A line", "voice_id": "gmnazjXOFoOcWA59sd5m"},
+    {"text": "Speaker B line", "voice_id": "1kNciG1jHVSuFBPoxdRZ"}
+  ]
+}
+
+4. Always alternate speakers (A → B → A → B)
+5. Keep it conversational and lively
+6. Speaker A introduces topics and asks questions
+7. Speaker B explains and provides insights
+
+Return ONLY the JSON format, no explanations.`
     );
 
-    // Extract the text content from the result - it's in _currentStep.output
+    // Extract the JSON dialogue from the result
     const resultObj = result as any;
-    const script = resultObj.state?._currentStep?.output || 
-                  resultObj.state?._lastTurnResponse?.output?.[0]?.content ||
-                  "Podcast script generation failed - please check agent output";
-    console.log("Podcast script generated successfully!");
+    const agentOutput = resultObj.state?._currentStep?.output || 
+                       resultObj.state?._lastTurnResponse?.output?.[0]?.content ||
+                       String(result);
+    
+    let dialogueData: Array<{ text: string; voice_id: string }>;
+    let script: string;
+    
+    try {
+      // Clean up the output - remove markdown code blocks if present
+      let cleanOutput = agentOutput.trim();
+      
+      // Remove markdown code blocks
+      if (cleanOutput.startsWith('```json')) {
+        cleanOutput = cleanOutput.replace(/^```json\s*/, '').replace(/\s*```$/, '');
+      } else if (cleanOutput.startsWith('```')) {
+        cleanOutput = cleanOutput.replace(/^```\s*/, '').replace(/\s*```$/, '');
+      }
+      
+      // Try to parse as JSON
+      const jsonData = JSON.parse(cleanOutput);
+      dialogueData = jsonData.dialogue;
+      
+      // Validate dialogue format meets AGENTS.md spec
+      const validation = validateDialogueFormat(dialogueData);
+      if (!validation.isValid) {
+        console.log("⚠️ Dialogue format validation failed:", validation.errors);
+        console.log("🔄 Attempting to fix format...");
+        dialogueData = fixDialogueFormat(dialogueData);
+      }
+      
+      script = dialogueData.map(item => item.text).join('\n\n');
+      console.log("✅ JSON dialogue format parsed successfully!");
+      console.log(`📝 Generated ${dialogueData.length} dialogue lines`);
+      console.log(`🎭 Speakers: Speaker A (${dialogueData.filter((_, i) => i % 2 === 0).length} lines), Speaker B (${dialogueData.filter((_, i) => i % 2 === 1).length} lines)`);
+    } catch (parseError) {
+      // Fallback: treat as plain text script
+      console.log("⚠️ JSON parse failed, using text format...");
+      console.log("Parse error:", parseError.message);
+      script = agentOutput;
+      dialogueData = convertTextToDialogue(script);
+    }
+    
+    console.log(`📝 Script generated: ${script.length} characters`);
     
     let audio: Buffer;
     
-    if (generateAudio) {
-      console.log("Converting script to audio using ElevenLabs...");
+    if (generateAudio && dialogueData.length > 0) {
+      console.log("🎵 Generating audio using ElevenLabs with dual voices...");
+      
+      // Generate audio for each dialogue segment with appropriate voice
+      const audioSegments = await Promise.all(
+        dialogueData.map(async (item) => {
+          try {
+            return await generatePodcastAudioWithVoice(item.text, item.voice_id);
+          } catch (error) {
+            console.log(`❌ Failed to generate audio for: ${item.text.substring(0, 50)}...`);
+            return null;
+          }
+        })
+      );
+      
+      // Filter out failed segments and concatenate
+      const validSegments = audioSegments.filter(segment => segment !== null) as Buffer[];
+      if (validSegments.length > 0) {
+        audio = Buffer.concat(validSegments);
+        console.log(`✅ Multi-voice audio generated: ${audio.length} bytes from ${validSegments.length} segments`);
+      } else {
+        throw new Error("All audio segments failed to generate");
+      }
+    } else if (generateAudio) {
+      // Fallback to single voice if no dialogue data
+      console.log("🎵 Generating audio with single voice fallback...");
       audio = await generatePodcastAudio(script);
-      console.log("Audio generated successfully!");
     } else {
-      console.log("Skipping audio generation...");
-      audio = Buffer.from(""); // Empty buffer for script-only mode
+      console.log("📝 Skipping audio generation...");
+      audio = Buffer.from("");
     }
     
-    return { script, audio };
+    return { script, audio, dialogue: dialogueData };
   } catch (error) {
-    console.error("Error in createPodcastFromUrl:", error);
+    console.error("❌ Error in createPodcastFromUrl:", error);
     throw error;
   }
+}
+
+// Validate dialogue format according to AGENTS.md spec
+function validateDialogueFormat(dialogue: Array<{ text: string; voice_id: string }>) {
+  const errors: string[] = [];
+  
+  // Check voice IDs match AGENTS.md specification
+  const speakerAVoiceId = 'gmnazjXOFoOcWA59sd5m';
+  const speakerBVoiceId = '1kNciG1jHVSuFBPoxdRZ';
+  
+  for (let i = 0; i < dialogue.length; i++) {
+    const item = dialogue[i];
+    const expectedVoiceId = i % 2 === 0 ? speakerAVoiceId : speakerBVoiceId;
+    const speakerName = i % 2 === 0 ? 'Speaker A' : 'Speaker B';
+    
+    if (item.voice_id !== expectedVoiceId) {
+      errors.push(`Line ${i + 1}: ${speakerName} should use voice_id "${expectedVoiceId}", got "${item.voice_id}"`);
+    }
+    
+    if (!item.text || item.text.trim().length === 0) {
+      errors.push(`Line ${i + 1}: Empty text content`);
+    }
+  }
+  
+  // Check character count
+  const totalChars = dialogue.reduce((sum, item) => sum + item.text.length, 0);
+  if (totalChars > 10000) {
+    errors.push(`Total character count ${totalChars} exceeds 10,000 limit`);
+  }
+  
+  return {
+    isValid: errors.length === 0,
+    errors,
+    totalChars,
+    lineCount: dialogue.length
+  };
+}
+
+// Fix dialogue format issues
+function fixDialogueFormat(dialogue: Array<{ text: string; voice_id: string }>) {
+  const speakerAVoiceId = 'gmnazjXOFoOcWA59sd5m';
+  const speakerBVoiceId = '1kNciG1jHVSuFBPoxdRZ';
+  
+  return dialogue.map((item, index) => ({
+    text: item.text,
+    voice_id: index % 2 === 0 ? speakerAVoiceId : speakerBVoiceId
+  }));
+}
+
+// Helper function to convert plain text to dialogue format
+function convertTextToDialogue(text: string): Array<{ text: string; voice_id: string }> {
+  const lines = text.split('\n').filter(line => line.trim().length > 0);
+  const dialogue: Array<{ text: string; voice_id: string }> = [];
+  
+  let speaker = 'A'; // Alternate between A and B
+  
+  for (const line of lines) {
+    if (line.trim()) {
+      const voiceId = speaker === 'A' ? 'gmnazjXOFoOcWA59sd5m' : '1kNciG1jHVSuFBPoxdRZ';
+      dialogue.push({ text: line.trim(), voice_id: voiceId });
+      speaker = speaker === 'A' ? 'B' : 'A';
+    }
+  }
+  
+  return dialogue;
+}
+
+// Generate audio with specific voice ID
+async function generatePodcastAudioWithVoice(text: string, voiceId: string): Promise<Buffer> {
+  // Create a modified version of the audio generation function that uses specific voice
+  const maxSegmentLength = 2500;
+  
+  if (text.length > maxSegmentLength) {
+    const segments = splitTextIntoSegments(text, maxSegmentLength);
+    console.log(`🎵 Generating ${segments.length} segments for voice ${voiceId}`);
+    
+    const audioPromises = segments.map(async (segment, index) => {
+      console.log(`🎙️ Segment ${index + 1}/${segments.length} (${segment.length} chars)`);
+      return await generateAudioSegment(segment, voiceId);
+    });
+    
+    const audioBuffers = await Promise.all(audioPromises);
+    return Buffer.concat(audioBuffers);
+  }
+  
+  return await generateAudioSegment(text, voiceId);
+}
+
+// Generate a single audio segment with specific voice
+async function generateAudioSegment(text: string, voiceId: string): Promise<Buffer> {
+  try {
+    // Use direct API for better control over voice ID
+    return await generatePodcastAudioDirectAPI(text, voiceId);
+  } catch (error) {
+    console.log(`❌ Direct API failed for ${voiceId}, trying AI SDK...`);
+    // Fallback to AI SDK approach
+    const result = await generateSpeechWithProgress(text, voiceId);
+    if (result.success && result.audio) {
+      return result.audio;
+    }
+    throw new Error(`Audio generation failed for voice ${voiceId}`);
+  }
+}
+
+// Split text into segments for processing
+function splitTextIntoSegments(text: string, maxLength: number): string[] {
+  const sentences = text.match(/[^.!?]+[.!?]+/g) || [text];
+  const segments: string[] = [];
+  let currentSegment = "";
+  
+  for (const sentence of sentences) {
+    if (currentSegment.length + sentence.length > maxLength && currentSegment) {
+      segments.push(currentSegment.trim());
+      currentSegment = sentence;
+    } else {
+      currentSegment += sentence;
+    }
+  }
+  
+  if (currentSegment) {
+    segments.push(currentSegment.trim());
+  }
+  
+  return segments;
 }
 
 async function savePodcastAudio(audio: Buffer, filename: string = "podcast.mp3"): Promise<void> {
@@ -403,7 +693,7 @@ async function main() {
     console.log(`📊 Starting podcast generation process...`);
     
     const startTime = Date.now();
-    const { script, audio } = await createPodcastFromUrl(articleUrl, mode === "all");
+    const { script, audio, dialogue } = await createPodcastFromUrl(articleUrl, mode === "all");
     const totalTime = Date.now() - startTime;
     
 console.log(`⏱️ Total process completed in ${totalTime/1000}s`);
@@ -412,6 +702,12 @@ console.log(`⏱️ Total process completed in ${totalTime/1000}s`);
     const fs = await import("fs/promises");
     await fs.writeFile("podcast-script.txt", script);
     console.log("📄 Podcast script saved as podcast-script.txt");
+    
+    // Save dialogue JSON if available
+    if (dialogue && dialogue.length > 0) {
+      await fs.writeFile("podcast-dialogue.json", JSON.stringify({ dialogue }, null, 2));
+      console.log("📄 Podcast dialogue saved as podcast-dialogue.json");
+    }
     
     // Save audio only if mode is "all"
     if (mode === "all") {
