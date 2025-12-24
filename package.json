@@ -6,7 +6,10 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "start": "dotenvx run -- node index.js",
-    "agent": "dotenvx run -- tsx agent.ts"
+    "agent": "dotenvx run -- tsx agent.ts",
+    "podcast": "dotenvx run -- tsx podcast-agent.ts",
+    "podcast-script": "dotenvx run -- tsx podcast-agent.ts",
+    "optimize-script": "dotenvx run -- tsx script-optimizer-agent.ts"
   },
   "keywords": [],
   "author": "",
@@ -14,10 +17,12 @@
   "type": "module",
   "dependencies": {
     "@ai-sdk/anthropic": "^3.0.1",
+    "@ai-sdk/elevenlabs": "^2.0.1",
     "@anthropic-ai/sdk": "^0.71.2",
     "@dotenvx/dotenvx": "^1.51.2",
     "@openai/agents": "^0.3.7",
     "@openai/agents-extensions": "^0.3.7",
+    "ai": "^6.0.3",
     "zod": "^4.2.1"
   },
   "devDependencies": {
